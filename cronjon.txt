@@ -1,0 +1,16 @@
+A scheduled trigger that runs daily at 2 AM UTC
+CloudWatch Events acts like a serverless cron job
+cron(0 2 * * ? *)
+     │ │ │ │ │ │
+     │ │ │ │ │ └── Year (optional)
+     │ │ │ │ └──── Day of week (? means any)
+     │ │ │ └────── Month (1-12)
+     │ │ └──────── Day of month (1-31)
+     │ └────────── Hour (0-23) → 2 AM
+     └──────────── Minute (0-59) → 0 minutes
+
+Other schedule examples:
+
+cron(0 2 * * ? *) - Daily at 2 AM
+cron(0 2 * * SUN *) - Weekly on Sunday at 2 AM
+cron(0 2 1 * ? *) - Monthly on 1st day at 2 AM
