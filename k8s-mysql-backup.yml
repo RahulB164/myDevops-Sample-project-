@@ -1,0 +1,72 @@
+ =============================================================================
+# KUBERNETES CRONJOB (k8s-mysql-backup.yml)
+# Location: k8s/ or manifests/ directory
+# =============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mysql-backup
+  namespace: production
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: mysql-backup
+            image: mysql:8.0
+            env:
+            - name: MYSQL_HOST
+              value: "mysql-service"
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: username
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: secret-access-key
+            command:
+            - /bin/bash
+            - -c
+            - |
+              apt-get update && apt-get install -y awscli
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              BACKUP_FILE="mysql_backup_${TIMESTAMP}.sql"
+              
+              mysqldump -h $MYSQL_HOST -u $MYSQL_USER -p$MYSQL_PASSWORD \
+                --all-databases --single-transaction > /tmp/$BACKUP_FILE
+              
+              gzip /tmp/$BACKUP_FILE
+              aws s3 cp /tmp/$BACKUP_FILE.gz s3://k8s-mysql-backups/
+              
+              echo "Backup completed: $BACKUP_FILE.gz"
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+---
+# Secret for MySQL credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-credentials
+  namespace: production
+type: Opaque
+data:
+  username: YmFja3VwX3VzZXI=  # backup_user (base64 encoded)
+  password: c2VjdXJlX3Bhc3N3b3Jk  # secure_password (base64 encoded)
