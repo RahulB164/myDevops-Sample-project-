@@ -1,0 +1,395 @@
+# =============================================================================
+# JENKINS PIPELINE (Jenkinsfile)
+# Location: Project root directory or configured in Jenkins job
+# =============================================================================
+
+pipeline {
+    agent any
+    
+    environment {
+        DB_HOST = 'localhost'
+        DB_USER = credentials('mysql-user')
+        DB_PASS = credentials('mysql-password')
+        DB_NAME = 'myapp_production'
+        BACKUP_PATH = '/var/backups/mysql'
+        S3_BUCKET = 'my-db-backups'
+    }
+    
+    stages {
+        stage('MySQL Backup') {
+            steps {
+                script {
+                    def timestamp = new Date().format('yyyy-MM-dd_HH-mm-ss')
+                    def backupFile = "${DB_NAME}_${timestamp}.sql"
+                    
+                    sh """
+                        mkdir -p ${BACKUP_PATH}
+                        mysqldump -h ${DB_HOST} -u ${DB_USER} -p${DB_PASS} \
+                            --single-transaction --routines --triggers \
+                            ${DB_NAME} > ${BACKUP_PATH}/${backupFile}
+                        
+                        # Compress backup
+                        gzip ${BACKUP_PATH}/${backupFile}
+                        
+                        # Upload to S3 (optional)
+                        aws s3 cp ${BACKUP_PATH}/${backupFile}.gz \
+                            s3://${S3_BUCKET}/mysql-backups/
+                        
+                        # Clean up old local backups (keep last 7 days)
+                        find ${BACKUP_PATH} -name "*.sql.gz" -mtime +7 -delete
+                    """
+                }
+            }
+        }
+    }
+    
+    triggers {
+        cron('0 2 * * *') // Daily at 2 AM
+    }
+}
+
+# =============================================================================
+# GITLAB CI/CD (.gitlab-ci.yml)
+# Location: Project root directory
+# =============================================================================
+
+variables:
+  DB_HOST: "mysql-server"
+  DB_NAME: "production_db"
+  BACKUP_PATH: "/tmp/backups"
+
+stages:
+  - backup
+
+mysql_backup:
+  stage: backup
+  image: mysql:8.0
+  services:
+    - mysql:8.0
+  variables:
+    MYSQL_ROOT_PASSWORD: $DB_PASSWORD
+  before_script:
+    - apt-get update && apt-get install -y awscli gzip
+    - mkdir -p $BACKUP_PATH
+  script:
+    - |
+      TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+      BACKUP_FILE="${DB_NAME}_${TIMESTAMP}.sql"
+      
+      # Create backup
+      mysqldump -h $DB_HOST -u $DB_USER -p$DB_PASSWORD \
+        --single-transaction --add-drop-table --routines \
+        $DB_NAME > $BACKUP_PATH/$BACKUP_FILE
+      
+      # Compress
+      gzip $BACKUP_PATH/$BACKUP_FILE
+      
+      # Upload to cloud storage
+      aws s3 cp $BACKUP_PATH/$BACKUP_FILE.gz s3://backup-bucket/mysql/
+      
+      echo "Backup completed: $BACKUP_FILE.gz"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  artifacts:
+    paths:
+      - $BACKUP_PATH/*.sql.gz
+    expire_in: 7 days
+
+# =============================================================================
+# ANSIBLE PLAYBOOK (backup-mysql.yml)
+# Location: playbooks/ directory in Ansible project
+# =============================================================================
+
+---
+- name: MySQL Database Backup
+  hosts: database_servers
+  become: yes
+  vars:
+    mysql_user: "{{ vault_mysql_user }}"
+    mysql_password: "{{ vault_mysql_password }}"
+    backup_dir: "/var/backups/mysql"
+    retention_days: 30
+    databases:
+      - production_db
+      - staging_db
+  
+  tasks:
+    - name: Ensure backup directory exists
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Create MySQL backup
+      shell: |
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        for DB in {{ databases | join(' ') }}; do
+          mysqldump -u {{ mysql_user }} -p{{ mysql_password }} \
+            --single-transaction --add-drop-table \
+            --routines --triggers $DB > {{ backup_dir }}/${DB}_${TIMESTAMP}.sql
+          gzip {{ backup_dir }}/${DB}_${TIMESTAMP}.sql
+        done
+      register: backup_result
+    
+    - name: Remove old backups
+      find:
+        paths: "{{ backup_dir }}"
+        patterns: "*.sql.gz"
+        age: "{{ retention_days }}d"
+      register: old_backups
+    
+    - name: Delete old backup files
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      with_items: "{{ old_backups.files }}"
+    
+    - name: Send backup to remote storage
+      synchronize:
+        src: "{{ backup_dir }}/"
+        dest: "backup-server:/backups/mysql/{{ inventory_hostname }}/"
+        delete: yes
+      delegate_to: localhost
+
+# Ansible inventory file (hosts.ini)
+# Location: inventory/ directory
+[database_servers]
+db1.example.com mysql_user=backup_user
+db2.example.com mysql_user=backup_user
+
+# Ansible vault file (group_vars/database_servers/vault.yml)
+# Encrypted with: ansible-vault encrypt vault.yml
+$ANSIBLE_VAULT;1.1;AES256
+vault_mysql_user: backup_user
+vault_mysql_password: secure_password_here
+
+# =============================================================================
+# GITHUB ACTIONS (.github/workflows/mysql-backup.yml)
+# Location: .github/workflows/ directory
+# =============================================================================
+
+name: MySQL Database Backup
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup MySQL Client
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mysql-client awscli
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Create MySQL Backup
+      env:
+        DB_HOST: ${{ secrets.DB_HOST }}
+        DB_USER: ${{ secrets.DB_USER }}
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        DB_NAME: ${{ secrets.DB_NAME }}
+      run: |
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        BACKUP_FILE="${DB_NAME}_${TIMESTAMP}.sql"
+        
+        # Create backup
+        mysqldump -h $DB_HOST -u $DB_USER -p$DB_PASSWORD \
+          --single-transaction --add-drop-table --routines \
+          $DB_NAME > $BACKUP_FILE
+        
+        # Compress
+        gzip $BACKUP_FILE
+        
+        # Upload to S3
+        aws s3 cp ${BACKUP_FILE}.gz s3://my-backup-bucket/mysql-backups/
+        
+        echo "Backup completed and uploaded: ${BACKUP_FILE}.gz"
+
+# =============================================================================
+# DOCKER COMPOSE (docker-compose.backup.yml)
+# Location: Project root directory
+# =============================================================================
+
+version: '3.8'
+
+services:
+  mysql-backup:
+    image: mysql:8.0
+    environment:
+      - MYSQL_HOST=mysql-server
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${DB_NAME}
+      - BACKUP_CRON=0 2 * * *
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh
+    command: >
+      bash -c "
+        apt-get update && apt-get install -y cron awscli &&
+        chmod +x /backup.sh &&
+        echo '$${BACKUP_CRON} /backup.sh' | crontab - &&
+        crond -f
+      "
+    depends_on:
+      - mysql-server
+
+  mysql-server:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:
+
+# =============================================================================
+# KUBERNETES CRONJOB (k8s-mysql-backup.yml)
+# Location: k8s/ or manifests/ directory
+# =============================================================================
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mysql-backup
+  namespace: production
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: mysql-backup
+            image: mysql:8.0
+            env:
+            - name: MYSQL_HOST
+              value: "mysql-service"
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: username
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-credentials
+                  key: password
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: secret-access-key
+            command:
+            - /bin/bash
+            - -c
+            - |
+              apt-get update && apt-get install -y awscli
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              BACKUP_FILE="mysql_backup_${TIMESTAMP}.sql"
+              
+              mysqldump -h $MYSQL_HOST -u $MYSQL_USER -p$MYSQL_PASSWORD \
+                --all-databases --single-transaction > /tmp/$BACKUP_FILE
+              
+              gzip /tmp/$BACKUP_FILE
+              aws s3 cp /tmp/$BACKUP_FILE.gz s3://k8s-mysql-backups/
+              
+              echo "Backup completed: $BACKUP_FILE.gz"
+          restartPolicy: OnFailure
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+---
+# Secret for MySQL credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-credentials
+  namespace: production
+type: Opaque
+data:
+  username: YmFja3VwX3VzZXI=  # backup_user (base64 encoded)
+  password: c2VjdXJlX3Bhc3N3b3Jk  # secure_password (base64 encoded)
+
+# =============================================================================
+# TERRAFORM (backup-infrastructure.tf)
+# Location: terraform/ directory
+# =============================================================================
+
+# Lambda function for automated MySQL backups
+resource "aws_lambda_function" "mysql_backup" {
+  filename         = "mysql-backup.zip"
+  function_name    = "mysql-backup-lambda"
+  role            = aws_iam_role.lambda_backup_role.arn
+  handler         = "index.handler"
+  runtime         = "python3.9"
+  timeout         = 300
+
+  vpc_config {
+    subnet_ids         = var.private_subnet_ids
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+
+  environment {
+    variables = {
+      RDS_ENDPOINT = var.rds_endpoint
+      S3_BUCKET    = aws_s3_bucket.backup_bucket.bucket
+      DB_NAME      = var.database_name
+    }
+  }
+}
+
+# CloudWatch event to trigger backup daily
+resource "aws_cloudwatch_event_rule" "mysql_backup_schedule" {
+  name                = "mysql-backup-schedule"
+  description         = "Daily MySQL backup trigger"
+  schedule_expression = "cron(0 2 * * ? *)"
+}
+
+resource "aws_cloudwatch_event_target" "lambda_target" {
+  rule      = aws_cloudwatch_event_rule.mysql_backup_schedule.name
+  target_id = "TriggerLambdaFunction"
+  arn       = aws_lambda_function.mysql_backup.arn
+}
+
+# S3 bucket for storing backups
+resource "aws_s3_bucket" "backup_bucket" {
+  bucket = "mysql-backups-${random_string.bucket_suffix.result}"
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "backup_lifecycle" {
+  bucket = aws_s3_bucket.backup_bucket.id
+
+  rule {
+    id     = "backup_retention"
+    status = "Enabled"
+
+    expiration {
+      days = 90
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+  }
+}
